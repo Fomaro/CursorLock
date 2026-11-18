@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <vector>
 
 // ============================================================================
 // ИДЕНТИФИКАТОРЫ
@@ -20,17 +21,37 @@ constexpr int HOTKEY_ID = 1;
 constexpr UINT ID_TRAY_TOGGLE   = 2001;
 constexpr UINT ID_TRAY_SETTINGS = 2002;
 constexpr UINT ID_TRAY_EXIT     = 2003;
+constexpr UINT ID_TRAY_MON_BASE = 2100; // 2100 = Auto, 2101 = Mon 1, 2102 = Mon 2, ...
+
+constexpr int IDC_COMBO_MONITOR = 3010;
+
+// ============================================================================
+// СТРУКТУРЫ
+// ============================================================================
+struct MonitorEntry {
+    HMONITOR hMon;
+    RECT rc;
+    RECT rcWork;
+    bool isPrimary;
+    wchar_t name[128];
+    wchar_t resolution[32];
+};
 
 // ============================================================================
 // ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СОСТОЯНИЯ
 // ============================================================================
 static HWND g_hMainWnd = nullptr;
 static HWND g_hSettingsWnd = nullptr;
+static HWND g_hComboMonitor = nullptr;
 
 // Текущая активная горячая клавиша (по умолчанию Ctrl + Alt + L)
 static UINT g_hotkeyModifiers = MOD_CONTROL | MOD_ALT;
 static UINT g_hotkeyVk = 'L';
 static wchar_t g_hotkeyStr[64] = L"Ctrl + Alt + L";
+
+// Целевой монитор для блокировки: 0 = Авто (под курсором), 1 = Монитор 1, 2 = Монитор 2...
+static int g_targetMonitor = 0;
+static int g_tempTargetMonitor = 0;
 
 // Временное состояние при интерактивной записи в окне настроек
 static UINT g_tempMods = MOD_CONTROL | MOD_ALT;
@@ -48,6 +69,7 @@ static HFONT g_hFontTitle = nullptr;
 static HFONT g_hFontNormal = nullptr;
 static HFONT g_hFontKey = nullptr;
 static HFONT g_hFontSmall = nullptr;
+static HFONT g_hFontUi = nullptr;
 
 // Состояние наведения мыши для кнопок в окне настроек
 enum HoverState {
@@ -63,6 +85,44 @@ static HoverState g_hoverState = HOVER_NONE;
 void StopRecording(bool commit);
 void FormatHotkeyParts(UINT mods, UINT vk, wchar_t parts[6][32], int& count);
 void GetKeyNameFriendly(UINT vk, wchar_t* outName, size_t maxLen);
+std::vector<MonitorEntry> GetMonitorsList();
+void ApplyTargetMonitor(int monIndex);
+
+// ============================================================================
+// ОПРЕДЕЛЕНИЕ И ПЕРЕЧИСЛЕНИЕ МОНИТОРОВ
+// ============================================================================
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC /*hdc*/, LPRECT /*lprc*/, LPARAM lParam) {
+    auto* list = reinterpret_cast<std::vector<MonitorEntry>*>(lParam);
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(MONITORINFOEXW);
+    if (GetMonitorInfoW(hMon, &mi)) {
+        MonitorEntry entry = {};
+        entry.hMon = hMon;
+        entry.rc = mi.rcMonitor;
+        entry.rcWork = mi.rcWork;
+        entry.isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+        int width = mi.rcMonitor.right - mi.rcMonitor.left;
+        int height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        wsprintfW(entry.resolution, L"%dx%d", width, height);
+
+        int idx = static_cast<int>(list->size()) + 1;
+        if (entry.isPrimary) {
+            wsprintfW(entry.name, L"Экран %d (Основной, %s)", idx, entry.resolution);
+        } else {
+            wsprintfW(entry.name, L"Экран %d (%s)", idx, entry.resolution);
+        }
+
+        list->push_back(entry);
+    }
+    return TRUE;
+}
+
+std::vector<MonitorEntry> GetMonitorsList() {
+    std::vector<MonitorEntry> list;
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&list));
+    return list;
+}
 
 // ============================================================================
 // ПОДДЕРЖКА DPI И ТЕМНОЙ ТЕМЫ WINDOWS 10 / 11
@@ -94,7 +154,6 @@ void EnableDarkTitleBar(HWND hWnd) {
         );
         if (pDwmSet) {
             BOOL dark = TRUE;
-            // DWMWA_USE_IMMERSIVE_DARK_MODE: 20 для Windows 11 / 10 (20H1+), 19 для Windows 10 (1809)
             if (FAILED(pDwmSet(hWnd, 20, &dark, sizeof(dark)))) {
                 pDwmSet(hWnd, 19, &dark, sizeof(dark));
             }
@@ -104,7 +163,7 @@ void EnableDarkTitleBar(HWND hWnd) {
 }
 
 // ============================================================================
-// СОХРАНЕНИЕ И ЗАГРУЗКА В РЕЕСТР WINDOWS (БЕЗ ВНЕШНИХ ФАЙЛОВ)
+// СОХРАНЕНИЕ И ЗАГРУЗКА В РЕЕСТР WINDOWS
 // ============================================================================
 constexpr const wchar_t* REG_KEY_PATH = L"Software\\CursorLock";
 
@@ -200,6 +259,7 @@ void LoadConfig() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         DWORD mods = defMods;
         DWORD vk = defVk;
+        DWORD targetMon = 0;
         DWORD size = sizeof(DWORD);
         DWORD type = REG_DWORD;
 
@@ -216,15 +276,24 @@ void LoadConfig() {
             g_hotkeyVk = defVk;
         }
 
+        size = sizeof(DWORD);
+        if (RegQueryValueExW(hKey, L"TargetMonitor", nullptr, &type, reinterpret_cast<LPBYTE>(&targetMon), &size) == ERROR_SUCCESS) {
+            g_targetMonitor = static_cast<int>(targetMon);
+        } else {
+            g_targetMonitor = 0;
+        }
+
         RegCloseKey(hKey);
     } else {
         g_hotkeyModifiers = defMods;
         g_hotkeyVk = defVk;
+        g_targetMonitor = 0;
     }
 
     FormatHotkeyFullString(g_hotkeyModifiers, g_hotkeyVk, g_hotkeyStr, sizeof(g_hotkeyStr) / sizeof(wchar_t));
     g_tempMods = g_hotkeyModifiers;
     g_tempVk = g_hotkeyVk;
+    g_tempTargetMonitor = g_targetMonitor;
 }
 
 void SaveConfig() {
@@ -233,9 +302,11 @@ void SaveConfig() {
                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
         DWORD mods = g_hotkeyModifiers;
         DWORD vk = g_hotkeyVk;
+        DWORD targetMon = static_cast<DWORD>(g_targetMonitor);
 
         RegSetValueExW(hKey, L"Modifiers", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&mods), sizeof(DWORD));
         RegSetValueExW(hKey, L"VkCode", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&vk), sizeof(DWORD));
+        RegSetValueExW(hKey, L"TargetMonitor", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&targetMon), sizeof(DWORD));
         RegSetValueExW(hKey, L"HotkeyStr", 0, REG_SZ, reinterpret_cast<const BYTE*>(g_hotkeyStr),
                       static_cast<DWORD>((wcslen(g_hotkeyStr) + 1) * sizeof(wchar_t)));
 
@@ -252,7 +323,7 @@ void UpdateTrayStatus(HWND hWnd) {
     if (g_isLocked) {
         wsprintfW(g_nid.szTip, L"CursorLock: Заблокировано (%s)", g_hotkeyStr);
         wsprintfW(g_nid.szInfoTitle, L"CursorLock");
-        wsprintfW(g_nid.szInfo, L"Курсор заблокирован на текущем мониторе");
+        wsprintfW(g_nid.szInfo, L"Курсор заблокирован на выбранном мониторе");
         g_nid.dwInfoFlags = NIIF_INFO;
     } else {
         wsprintfW(g_nid.szTip, L"CursorLock: Свободно (%s)", g_hotkeyStr);
@@ -266,24 +337,72 @@ void UpdateTrayStatus(HWND hWnd) {
 
 void ToggleCursorLock(HWND hWnd) {
     if (!g_isLocked) {
-        POINT pt = {};
-        if (GetCursorPos(&pt)) {
-            HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi = {};
-            mi.cbSize = sizeof(MONITORINFO);
-            if (GetMonitorInfoW(hMonitor, &mi)) {
-                g_lockedRect = mi.rcMonitor;
-                ClipCursor(&g_lockedRect);
-                g_isLocked = true;
-                SetTimer(hWnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
-                UpdateTrayStatus(hWnd);
+        auto monitors = GetMonitorsList();
+        RECT targetRect = {};
+        bool found = false;
+
+        // Если задан конкретный монитор (1, 2, ...)
+        if (g_targetMonitor > 0 && g_targetMonitor <= static_cast<int>(monitors.size())) {
+            targetRect = monitors[g_targetMonitor - 1].rc;
+            found = true;
+
+            // Если курсор за пределами целевого монитора, переносим его в центр целевого экрана
+            POINT pt = {};
+            GetCursorPos(&pt);
+            if (pt.x < targetRect.left || pt.x >= targetRect.right ||
+                pt.y < targetRect.top  || pt.y >= targetRect.bottom) {
+                int cx = targetRect.left + (targetRect.right - targetRect.left) / 2;
+                int cy = targetRect.top  + (targetRect.bottom - targetRect.top) / 2;
+                SetCursorPos(cx, cy);
             }
+        } else {
+            // Режим Авто: определяем монитор под курсором
+            POINT pt = {};
+            if (GetCursorPos(&pt)) {
+                HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = {};
+                mi.cbSize = sizeof(MONITORINFO);
+                if (GetMonitorInfoW(hMonitor, &mi)) {
+                    targetRect = mi.rcMonitor;
+                    found = true;
+                }
+            }
+        }
+
+        if (found) {
+            g_lockedRect = targetRect;
+            ClipCursor(&g_lockedRect);
+            g_isLocked = true;
+            SetTimer(hWnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
+            UpdateTrayStatus(hWnd);
         }
     } else {
         g_isLocked = false;
         KillTimer(hWnd, TIMER_ID);
         ClipCursor(nullptr);
         UpdateTrayStatus(hWnd);
+    }
+}
+
+void ApplyTargetMonitor(int monIndex) {
+    g_targetMonitor = monIndex;
+    SaveConfig();
+
+    // Если сейчас курсор заблокирован, перенаправляем ограничение на новый монитор
+    if (g_isLocked) {
+        auto monitors = GetMonitorsList();
+        if (g_targetMonitor > 0 && g_targetMonitor <= static_cast<int>(monitors.size())) {
+            g_lockedRect = monitors[g_targetMonitor - 1].rc;
+            POINT pt = {};
+            GetCursorPos(&pt);
+            if (pt.x < g_lockedRect.left || pt.x >= g_lockedRect.right ||
+                pt.y < g_lockedRect.top  || pt.y >= g_lockedRect.bottom) {
+                int cx = g_lockedRect.left + (g_lockedRect.right - g_lockedRect.left) / 2;
+                int cy = g_lockedRect.top  + (g_lockedRect.bottom - g_lockedRect.top) / 2;
+                SetCursorPos(cx, cy);
+            }
+            ClipCursor(&g_lockedRect);
+        }
     }
 }
 
@@ -296,7 +415,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         DWORD vk = pKbd->vkCode;
 
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-            // Если нажат Escape без модификаторов — отмена записи
             if (vk == VK_ESCAPE && (GetAsyncKeyState(VK_CONTROL) & 0x8000) == 0 &&
                                    (GetAsyncKeyState(VK_MENU) & 0x8000) == 0 &&
                                    (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0 &&
@@ -306,7 +424,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 return 1;
             }
 
-            // Определение зажатых модификаторов
             bool isCtrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 || vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL;
             bool isAlt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 || vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU;
             bool isShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 || vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT;
@@ -326,7 +443,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             g_tempMods = mods;
 
             if (!isModifierKey) {
-                // Нажата основная клавиша! Завершаем запись комбинации
                 g_tempVk = vk;
                 StopRecording(true);
             } else {
@@ -335,9 +451,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(g_hSettingsWnd, nullptr, FALSE);
                 }
             }
-            return 1; // Подавляем клавишу, чтобы предотвратить системные меню и действия
+            return 1;
         } else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-            // Если отпустили модификатор до нажатия основной клавиши
             bool isCtrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             bool isAlt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             bool isShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -393,12 +508,12 @@ void StopRecording(bool commit) {
 // ОТРИСОВКА ОКНА НАСТРОЕК (DARK FLUENT DESIGN)
 // ============================================================================
 constexpr int DLG_WIDTH = 480;
-constexpr int DLG_HEIGHT = 340;
+constexpr int DLG_HEIGHT = 410;
 
 constexpr RECT RC_RECORDER   = { 28, 100, 452, 178 };
-constexpr RECT RC_BTN_SAVE   = { 28, 260, 150, 298 };
-constexpr RECT RC_BTN_RESET  = { 165, 260, 310, 298 };
-constexpr RECT RC_BTN_CANCEL = { 325, 260, 452, 298 };
+constexpr RECT RC_BTN_SAVE   = { 28, 335, 150, 373 };
+constexpr RECT RC_BTN_RESET  = { 165, 335, 310, 373 };
+constexpr RECT RC_BTN_CANCEL = { 325, 335, 452, 373 };
 
 void DrawRoundedBox(HDC hdc, const RECT& rc, COLORREF bg, COLORREF border, int borderWidth = 1, int radius = 8) {
     HPEN hPen = (borderWidth > 0) ? CreatePen(PS_SOLID, borderWidth, border) : CreatePen(PS_NULL, 0, 0);
@@ -431,20 +546,20 @@ void PaintSettingsWindow(HWND hWnd, HDC hdc) {
     // Заголовок
     SelectObject(memDC, g_hFontTitle);
     SetTextColor(memDC, RGB(255, 255, 255));
-    RECT rcTitle = { 28, 20, 452, 48 };
-    DrawTextW(memDC, L"Настройки горячей клавиши", -1, &rcTitle, DT_LEFT | DT_SINGLELINE);
+    RECT rcTitle = { 28, 18, 452, 44 };
+    DrawTextW(memDC, L"Настройки CursorLock", -1, &rcTitle, DT_LEFT | DT_SINGLELINE);
 
     // Подзаголовок
     SelectObject(memDC, g_hFontSmall);
     SetTextColor(memDC, RGB(161, 161, 170));
-    RECT rcSub = { 28, 48, 452, 70 };
-    DrawTextW(memDC, L"CursorLock — переключение фиксации курсора на текущем мониторе", -1, &rcSub, DT_LEFT | DT_SINGLELINE);
+    RECT rcSub = { 28, 45, 452, 65 };
+    DrawTextW(memDC, L"Фиксация курсора мыши в границах выбранного монитора", -1, &rcSub, DT_LEFT | DT_SINGLELINE);
 
-    // Метка
+    // Метка горячей клавиши
     SelectObject(memDC, g_hFontNormal);
     SetTextColor(memDC, RGB(228, 228, 231));
-    RECT rcLabel = { 28, 76, 452, 98 };
-    DrawTextW(memDC, L"Комбинация клавиш для блокировки:", -1, &rcLabel, DT_LEFT | DT_SINGLELINE);
+    RECT rcLabelKey = { 28, 74, 452, 94 };
+    DrawTextW(memDC, L"Горячая клавиша для переключения:", -1, &rcLabelKey, DT_LEFT | DT_SINGLELINE);
 
     // Карточка-рекордер
     COLORREF recBg = g_isRecording ? RGB(30, 41, 59) : (g_hoverState == HOVER_RECORDER ? RGB(45, 45, 52) : RGB(39, 39, 42));
@@ -531,13 +646,19 @@ void PaintSettingsWindow(HWND hWnd, HDC hdc) {
         DrawTextW(memDC, L"Кликните сюда, чтобы задать новую комбинацию", -1, &rcClickHint, DT_CENTER | DT_SINGLELINE);
     }
 
-    // Совет
+    // Метка выбора монитора
+    SelectObject(memDC, g_hFontNormal);
+    SetTextColor(memDC, RGB(228, 228, 231));
+    RECT rcLabelMon = { 28, 192, 452, 212 };
+    DrawTextW(memDC, L"Монитор для блокировки курсора:", -1, &rcLabelMon, DT_LEFT | DT_SINGLELINE);
+
+    // Подсказка под селектором
     SelectObject(memDC, g_hFontSmall);
     SetTextColor(memDC, RGB(161, 161, 170));
-    RECT rcInfo = { 28, 190, 452, 245 };
+    RECT rcInfo = { 28, 258, 452, 318 };
     DrawTextW(memDC,
-        L"💡 Просто нажмите на поле и используйте нужные клавиши на клавиатуре.\n"
-        L"Поддерживаются любые сочетания: например, Ctrl + Alt + F, Win + Z, F7 или Caps Lock.",
+        L"💡 В режиме «Авто» курсор блокируется на том мониторе, где находится в момент нажатия.\n"
+        L"При выборе конкретного экрана курсор автоматически перемещается на него.",
         -1, &rcInfo, DT_LEFT | DT_WORDBREAK);
 
     // Кнопка «Сохранить»
@@ -591,7 +712,41 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         g_hFontSmall = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 
+        g_hFontUi = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
         EnableDarkTitleBar(hWnd);
+
+        // Создаем выпадающий список для выбора монитора
+        g_hComboMonitor = CreateWindowExW(
+            0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
+            28, 218, 424, 200,
+            hWnd, reinterpret_cast<HMENU>(IDC_COMBO_MONITOR),
+            GetModuleHandleW(nullptr), nullptr
+        );
+
+        if (g_hComboMonitor) {
+            SendMessageW(g_hComboMonitor, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontUi), TRUE);
+
+            // Заполняем список: 0 = Авто
+            int idxAuto = static_cast<int>(SendMessageW(g_hComboMonitor, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Авто: определять экран под курсором")));
+            SendMessageW(g_hComboMonitor, CB_SETITEMDATA, idxAuto, 0);
+
+            // Список физических мониторов
+            auto monitors = GetMonitorsList();
+            int curSel = 0;
+            for (size_t i = 0; i < monitors.size(); ++i) {
+                int idx = static_cast<int>(SendMessageW(g_hComboMonitor, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(monitors[i].name)));
+                SendMessageW(g_hComboMonitor, CB_SETITEMDATA, idx, static_cast<LPARAM>(i + 1));
+                if (g_tempTargetMonitor == static_cast<int>(i + 1)) {
+                    curSel = idx;
+                }
+            }
+
+            SendMessageW(g_hComboMonitor, CB_SETCURSEL, curSel, 0);
+        }
+
         return 0;
     }
 
@@ -665,6 +820,15 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 return 0;
             }
 
+            // Получаем выбранный монитор из комбобокса
+            int selectedMon = 0;
+            if (g_hComboMonitor) {
+                int curSel = static_cast<int>(SendMessageW(g_hComboMonitor, CB_GETCURSEL, 0, 0));
+                if (curSel != CB_ERR) {
+                    selectedMon = static_cast<int>(SendMessageW(g_hComboMonitor, CB_GETITEMDATA, curSel, 0));
+                }
+            }
+
             UnregisterHotKey(g_hMainWnd, HOTKEY_ID);
             if (!RegisterHotKey(g_hMainWnd, HOTKEY_ID, g_tempMods, g_tempVk)) {
                 RegisterHotKey(g_hMainWnd, HOTKEY_ID, g_hotkeyModifiers, g_hotkeyVk);
@@ -679,11 +843,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             g_hotkeyModifiers = g_tempMods;
             g_hotkeyVk = g_tempVk;
             FormatHotkeyFullString(g_hotkeyModifiers, g_hotkeyVk, g_hotkeyStr, sizeof(g_hotkeyStr) / sizeof(wchar_t));
-            SaveConfig();
+
+            ApplyTargetMonitor(selectedMon);
             UpdateTrayStatus(g_hMainWnd);
 
             wchar_t msgBuf[128];
-            wsprintfW(msgBuf, L"Горячая клавиша успешно сохранена:\n%s", g_hotkeyStr);
+            wsprintfW(msgBuf, L"Настройки сохранены!\nГорячая клавиша: %s", g_hotkeyStr);
             MessageBoxW(hWnd, msgBuf, L"CursorLock", MB_OK | MB_ICONINFORMATION);
 
             DestroyWindow(hWnd);
@@ -693,6 +858,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (PtInRectHelper(RC_BTN_RESET, pt)) {
             g_tempMods = MOD_CONTROL | MOD_ALT;
             g_tempVk = 'L';
+            if (g_hComboMonitor) {
+                SendMessageW(g_hComboMonitor, CB_SETCURSEL, 0, 0);
+            }
             InvalidateRect(hWnd, nullptr, FALSE);
             return 0;
         }
@@ -715,6 +883,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = nullptr; }
         if (g_hFontKey)    { DeleteObject(g_hFontKey);    g_hFontKey = nullptr; }
         if (g_hFontSmall)  { DeleteObject(g_hFontSmall);  g_hFontSmall = nullptr; }
+        if (g_hFontUi)     { DeleteObject(g_hFontUi);     g_hFontUi = nullptr; }
+        g_hComboMonitor = nullptr;
         g_hSettingsWnd = nullptr;
         return 0;
     }
@@ -730,6 +900,7 @@ void OpenSettingsWindow(HINSTANCE hInstance) {
 
     g_tempMods = g_hotkeyModifiers;
     g_tempVk = g_hotkeyVk;
+    g_tempTargetMonitor = g_targetMonitor;
     g_isRecording = false;
 
     const wchar_t SETTINGS_CLASS[] = L"CursorLock_ModernSettingsWindow";
@@ -782,7 +953,7 @@ void OpenSettingsWindow(HINSTANCE hInstance) {
 // ============================================================================
 // МЕНЮ ТРЕЯ И ОСНОВНОЙ ЦИКЛ
 // ============================================================================
-void ShowTrayContextMenu(HWND hWnd, HINSTANCE hInstance) {
+void ShowTrayContextMenu(HWND hWnd, HINSTANCE /*hInstance*/) {
     POINT pt = {};
     GetCursorPos(&pt);
 
@@ -798,6 +969,23 @@ void ShowTrayContextMenu(HWND hWnd, HINSTANCE hInstance) {
 
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE, toggleItemText);
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
+    // Подменю выбора целевого экрана
+    HMENU hSubMon = CreatePopupMenu();
+    if (hSubMon) {
+        UINT flagAuto = (g_targetMonitor == 0) ? MF_CHECKED : MF_UNCHECKED;
+        AppendMenuW(hSubMon, MF_STRING | flagAuto, ID_TRAY_MON_BASE, L"Авто (где находится курсор)");
+        AppendMenuW(hSubMon, MF_SEPARATOR, 0, nullptr);
+
+        auto monitors = GetMonitorsList();
+        for (size_t i = 0; i < monitors.size(); ++i) {
+            UINT flagMon = (g_targetMonitor == static_cast<int>(i + 1)) ? MF_CHECKED : MF_UNCHECKED;
+            AppendMenuW(hSubMon, MF_STRING | flagMon, ID_TRAY_MON_BASE + 1 + static_cast<UINT>(i), monitors[i].name);
+        }
+
+        AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSubMon), L"Целевой экран");
+    }
+
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"Настройки горячей клавиши...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Выход");
@@ -835,21 +1023,25 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
         break;
 
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case ID_TRAY_TOGGLE:
+    case WM_COMMAND: {
+        WORD cmdId = LOWORD(wParam);
+        if (cmdId == ID_TRAY_TOGGLE) {
             ToggleCursorLock(hWnd);
             return 0;
-        case ID_TRAY_SETTINGS: {
+        } else if (cmdId == ID_TRAY_SETTINGS) {
             HINSTANCE hInst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hWnd, GWLP_HINSTANCE));
             OpenSettingsWindow(hInst);
             return 0;
-        }
-        case ID_TRAY_EXIT:
+        } else if (cmdId == ID_TRAY_EXIT) {
             DestroyWindow(hWnd);
+            return 0;
+        } else if (cmdId >= ID_TRAY_MON_BASE && cmdId < ID_TRAY_MON_BASE + 20) {
+            int selected = static_cast<int>(cmdId - ID_TRAY_MON_BASE);
+            ApplyTargetMonitor(selected);
             return 0;
         }
         break;
+    }
 
     case WM_DESTROY:
         if (g_hSettingsWnd) {
@@ -886,8 +1078,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
 
     const wchar_t CLASS_NAME[] = L"CursorLock_HiddenMainWindow";
 
-    WNDCLASSEXW wc = {};
     HICON hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
+    WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = MainWndProc;
     wc.hInstance = hInstance;
@@ -953,6 +1145,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
 
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        if (g_hSettingsWnd && IsDialogMessageW(g_hSettingsWnd, &msg)) {
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
