@@ -1,0 +1,20 @@
+# Build artifacts and binaries
+*.exe
+*.o
+*.obj
+*.res
+*.ini
+*.log
+
+# IDE & Editor artifacts
+.vscode/
+.idea/
+*.suo
+*.user
+build/
+bin/
+
+# Temporary and python files
+*.pyc
+__pycache__/
+find_windows.py

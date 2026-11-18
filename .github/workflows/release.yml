@@ -1,0 +1,36 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: Build Executable
+        run: |
+          windres resource.rc -O coff -o resource.res
+          g++ -O2 -municode -mwindows -static -static-libgcc -static-libstdc++ main.cpp resource.res -o CursorLock.exe -luser32 -lshell32 -lgdi32 -ladvapi32
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CursorLock.exe
+          tag_name: ${{ github.ref_name }}
+          name: CursorLock ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
