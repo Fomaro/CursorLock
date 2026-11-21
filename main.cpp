@@ -1071,9 +1071,10 @@ void ShowTrayContextMenu(HWND hWnd, HINSTANCE /*hInstance*/) {
         }
 
         AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSubMon), L"Целевой экран");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     }
 
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"Настройки горячей клавиши...");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"Настройки...");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Выход");
 
