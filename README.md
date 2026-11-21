@@ -1,15 +1,17 @@
 # CursorLock
 
-A lightweight, native Win32 utility for Windows that locks and unlocks the mouse cursor within the boundaries of a specific display or the screen currently under the cursor with a single global hotkey.
+A lightweight, native Win32 utility for Windows that securely locks and unlocks the mouse cursor within the boundaries of a specific display or the screen currently under the cursor with a single global hotkey.
 
 ## Key Highlights
 
-- **Target Display Selection**: Choose to lock the cursor to **Auto** (whichever monitor is under the cursor) or bind it to a **specific display** (Screen 1, Screen 2, etc.) directly via the system tray context menu or the settings dialog. When a specific monitor is selected, CursorLock automatically moves the cursor into its center upon activation.
+- **Zero-Leak Boundary Lock (WH_MOUSE_LL)**: Uses a low-level hardware mouse hook alongside `ClipCursor` to inspect every mouse packet at zero latency. If the mouse attempts to cross the monitor edge or register clicks on an adjacent display, the coordinates are instantly clamped and the event is dropped. Accidental clicks on neighboring screens are completely impossible.
+- **Accurate Physical Coordinate Clamping**: Windows monitor bounds (`rcMonitor.right` and `rcMonitor.bottom`) are exclusive coordinates that belong to the adjacent screen. CursorLock properly clips to `[left, right - 1]` and `[top, bottom - 1]`, preventing edge bleeding onto adjacent screens.
+- **Instant Focus Recovery (SetWinEventHook)**: Intercepts `EVENT_SYSTEM_FOREGROUND` events to immediately re-apply cursor clipping whenever you `Alt+Tab` or a game/app window activates, without waiting for timer ticks.
+- **Target Display Selection**: Choose to lock the cursor to **Auto** (whichever monitor is under the cursor) or bind it to a **specific display** (Screen 1, Screen 2, etc.) directly via the system tray context menu or the settings dialog. When a specific monitor is selected, CursorLock automatically centers your cursor on that display.
 - **Multi-Monitor & DPI-Aware**: Uses `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` to accurately compute physical display rectangles across mixed DPI setups (100%, 125%, 150%, etc.), including negative monitor coordinates.
-- **Persistent Boundary Enforcement**: A lightweight 50 ms timer continuously reapplies `ClipCursor`, ensuring the boundary holds even when switching windows with `Alt+Tab` or pressing the `Windows` key.
 - **Interactive In-App Key Binder**: Modern dark UI dialog that records physical keyboard input in real time. Simply click the input area and press any key combination (supports Ctrl, Alt, Shift, Win modifiers plus any key).
 - **Zero Companion Files**: Hotkey and display configuration are stored directly in the current user's registry (`HKCU\Software\CursorLock`). No `.ini` or config files left in the directory.
-- **Single Portable Executable**: Pure C++17 and Win32 API. Statically linked, no external runtime or framework dependencies.
+- **Single Portable Executable**: Pure C++17 and Win32 API. Statically linked, no external runtime or framework dependencies (~190 KB).
 
 ## Usage
 

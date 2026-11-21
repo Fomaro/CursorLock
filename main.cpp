@@ -5,17 +5,19 @@
 #define _UNICODE
 #endif
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <windows.h>
 #include <shellapi.h>
 #include <vector>
+#include <algorithm>
 
 // ============================================================================
 // ИДЕНТИФИКАТОРЫ
 // ============================================================================
 constexpr UINT WM_TRAYICON = WM_APP + 100;
 constexpr UINT_PTR TIMER_ID = 1001;
-constexpr UINT TIMER_INTERVAL_MS = 50;
+constexpr UINT TIMER_INTERVAL_MS = 10; // Высокочастотный таймер-heartbeat 10 мс
 constexpr int HOTKEY_ID = 1;
 
 constexpr UINT ID_TRAY_TOGGLE   = 2001;
@@ -59,9 +61,14 @@ static UINT g_tempVk = 'L';
 static bool g_isRecording = false;
 static HHOOK g_hKeyHook = nullptr;
 
+// Хуки для абсолютной непроницаемости курсора
+static HHOOK g_hMouseHook = nullptr;
+static HWINEVENTHOOK g_hWinEventHook = nullptr;
+
 // Состояние блокировки курсора
 static bool g_isLocked = false;
 static RECT g_lockedRect = { 0, 0, 0, 0 };
+static RECT g_safeRect = { 0, 0, 0, 0 };
 static NOTIFYICONDATAW g_nid = {};
 
 // Шрифты для интерфейса
@@ -122,6 +129,44 @@ std::vector<MonitorEntry> GetMonitorsList() {
     std::vector<MonitorEntry> list;
     EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&list));
     return list;
+}
+
+// ============================================================================
+// ХУКИ ЗАЩИТЫ КУРСОРА (0 MS ЗАДЕРЖКА, БЛОКИРОВКА ВЫЛЕТОВ И СЛУЧАЙНЫХ КЛИКОВ)
+// ============================================================================
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && g_isLocked) {
+        MSLLHOOKSTRUCT* pMouse = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+
+        // Проверяем, выходит ли позиция курсора за пределы безопасного диапазона целевого монитора
+        bool isOutside = (pMouse->pt.x < g_safeRect.left ||
+                          pMouse->pt.x > g_safeRect.right ||
+                          pMouse->pt.y < g_safeRect.top  ||
+                          pMouse->pt.y > g_safeRect.bottom);
+
+        if (isOutside) {
+            // Принудительно удерживаем координаты внутри границ экрана
+            int clampedX = (std::max)(g_safeRect.left, (std::min)(pMouse->pt.x, g_safeRect.right));
+            int clampedY = (std::max)(g_safeRect.top,  (std::min)(pMouse->pt.y, g_safeRect.bottom));
+
+            SetCursorPos(clampedX, clampedY);
+            ClipCursor(&g_lockedRect);
+
+            // МГНОВЕННО БЛОКИРУЕМ событие:
+            // Windows не отправит ни движение мыши, ни клик на соседний экран!
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+}
+
+void CALLBACK WinEventProc(HWINEVENTHOOK /*hWinEventHook*/, DWORD event, HWND /*hWnd*/,
+                           LONG /*idObject*/, LONG /*idChild*/, DWORD /*dwEventThread*/, DWORD /*dwmsEventTime*/) {
+    // При переключении окон (Alt+Tab, активация окна) Windows сбрасывает ClipCursor.
+    // Перехватываем смену активного окна с нулевой задержкой и мгновенно восстанавливаем границы!
+    if (g_isLocked && event == EVENT_SYSTEM_FOREGROUND) {
+        ClipCursor(&g_lockedRect);
+    }
 }
 
 // ============================================================================
@@ -323,7 +368,7 @@ void UpdateTrayStatus(HWND hWnd) {
     if (g_isLocked) {
         wsprintfW(g_nid.szTip, L"CursorLock: Заблокировано (%s)", g_hotkeyStr);
         wsprintfW(g_nid.szInfoTitle, L"CursorLock");
-        wsprintfW(g_nid.szInfo, L"Курсор заблокирован на выбранном мониторе");
+        wsprintfW(g_nid.szInfo, L"Курсор надёжно зафиксирован на выбранном мониторе");
         g_nid.dwInfoFlags = NIIF_INFO;
     } else {
         wsprintfW(g_nid.szTip, L"CursorLock: Свободно (%s)", g_hotkeyStr);
@@ -370,15 +415,54 @@ void ToggleCursorLock(HWND hWnd) {
         }
 
         if (found) {
-            g_lockedRect = targetRect;
-            ClipCursor(&g_lockedRect);
+            // В Windows rcMonitor.right и rcMonitor.bottom эксклюзивны (первый пиксель соседнего экрана).
+            // Чтобы физически исключить перескок курсора на соседний монитор:
+            // безопасный диапазон координат strictly [left, right - 1] и [top, bottom - 1]!
+            g_safeRect.left = targetRect.left;
+            g_safeRect.top = targetRect.top;
+            g_safeRect.right = targetRect.right - 1;
+            g_safeRect.bottom = targetRect.bottom - 1;
+
+            g_lockedRect = g_safeRect;
             g_isLocked = true;
+
+            // 1. Активируем системное ограничение ClipCursor
+            ClipCursor(&g_lockedRect);
+
+            // 2. Устанавливаем низкоуровневый хук мыши (WH_MOUSE_LL)
+            // Ловит любые перемещения на уровне драйвера и БЛОКИРУЕТ случайные клики на соседних экранах
+            HINSTANCE hInst = GetModuleHandleW(nullptr);
+            if (!g_hMouseHook) {
+                g_hMouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hInst, 0);
+            }
+
+            // 3. Устанавливаем хук смены активного окна (WinEventHook)
+            // Мгновенно восстанавливает ClipCursor при Alt+Tab без ожидания тика таймера
+            if (!g_hWinEventHook) {
+                g_hWinEventHook = SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                    nullptr, WinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT
+                );
+            }
+
+            // 4. Высокочастотный таймер 10 мс как фоновая защита
             SetTimer(hWnd, TIMER_ID, TIMER_INTERVAL_MS, nullptr);
+
             UpdateTrayStatus(hWnd);
         }
     } else {
         g_isLocked = false;
         KillTimer(hWnd, TIMER_ID);
+
+        if (g_hMouseHook) {
+            UnhookWindowsHookEx(g_hMouseHook);
+            g_hMouseHook = nullptr;
+        }
+        if (g_hWinEventHook) {
+            UnhookWinEvent(g_hWinEventHook);
+            g_hWinEventHook = nullptr;
+        }
+
         ClipCursor(nullptr);
         UpdateTrayStatus(hWnd);
     }
@@ -388,17 +472,23 @@ void ApplyTargetMonitor(int monIndex) {
     g_targetMonitor = monIndex;
     SaveConfig();
 
-    // Если сейчас курсор заблокирован, перенаправляем ограничение на новый монитор
     if (g_isLocked) {
         auto monitors = GetMonitorsList();
         if (g_targetMonitor > 0 && g_targetMonitor <= static_cast<int>(monitors.size())) {
-            g_lockedRect = monitors[g_targetMonitor - 1].rc;
+            RECT targetRect = monitors[g_targetMonitor - 1].rc;
+
+            g_safeRect.left = targetRect.left;
+            g_safeRect.top = targetRect.top;
+            g_safeRect.right = targetRect.right - 1;
+            g_safeRect.bottom = targetRect.bottom - 1;
+            g_lockedRect = g_safeRect;
+
             POINT pt = {};
             GetCursorPos(&pt);
-            if (pt.x < g_lockedRect.left || pt.x >= g_lockedRect.right ||
-                pt.y < g_lockedRect.top  || pt.y >= g_lockedRect.bottom) {
-                int cx = g_lockedRect.left + (g_lockedRect.right - g_lockedRect.left) / 2;
-                int cy = g_lockedRect.top  + (g_lockedRect.bottom - g_lockedRect.top) / 2;
+            if (pt.x < g_safeRect.left || pt.x > g_safeRect.right ||
+                pt.y < g_safeRect.top  || pt.y > g_safeRect.bottom) {
+                int cx = g_safeRect.left + (g_safeRect.right - g_safeRect.left) / 2;
+                int cy = g_safeRect.top  + (g_safeRect.bottom - g_safeRect.top) / 2;
                 SetCursorPos(cx, cy);
             }
             ClipCursor(&g_lockedRect);
@@ -553,7 +643,7 @@ void PaintSettingsWindow(HWND hWnd, HDC hdc) {
     SelectObject(memDC, g_hFontSmall);
     SetTextColor(memDC, RGB(161, 161, 170));
     RECT rcSub = { 28, 45, 452, 65 };
-    DrawTextW(memDC, L"Фиксация курсора мыши в границах выбранного монитора", -1, &rcSub, DT_LEFT | DT_SINGLELINE);
+    DrawTextW(memDC, L"Абсолютная фиксация курсора мыши в границах выбранного монитора", -1, &rcSub, DT_LEFT | DT_SINGLELINE);
 
     // Метка горячей клавиши
     SelectObject(memDC, g_hFontNormal);
@@ -657,8 +747,8 @@ void PaintSettingsWindow(HWND hWnd, HDC hdc) {
     SetTextColor(memDC, RGB(161, 161, 170));
     RECT rcInfo = { 28, 258, 452, 318 };
     DrawTextW(memDC,
-        L"💡 В режиме «Авто» курсор блокируется на том мониторе, где находится в момент нажатия.\n"
-        L"При выборе конкретного экрана курсор автоматически перемещается на него.",
+        L"🛡️ Двойная защита: хук мыши (WH_MOUSE_LL) полностью блокирует вылет курсора и случайные клики.\n"
+        L"Курсор физически изолирован внутри выбранного экрана даже при резких движениях мыши.",
         -1, &rcInfo, DT_LEFT | DT_WORDBREAK);
 
     // Кнопка «Сохранить»
@@ -729,11 +819,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (g_hComboMonitor) {
             SendMessageW(g_hComboMonitor, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontUi), TRUE);
 
-            // Заполняем список: 0 = Авто
             int idxAuto = static_cast<int>(SendMessageW(g_hComboMonitor, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Авто: определять экран под курсором")));
             SendMessageW(g_hComboMonitor, CB_SETITEMDATA, idxAuto, 0);
 
-            // Список физических мониторов
             auto monitors = GetMonitorsList();
             int curSel = 0;
             for (size_t i = 0; i < monitors.size(); ++i) {
@@ -820,7 +908,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 return 0;
             }
 
-            // Получаем выбранный монитор из комбобокса
             int selectedMon = 0;
             if (g_hComboMonitor) {
                 int curSel = static_cast<int>(SendMessageW(g_hComboMonitor, CB_GETCURSEL, 0, 0));
@@ -1007,6 +1094,16 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_TIMER:
         if (wParam == TIMER_ID && g_isLocked) {
+            // Резервная проверка позиции курсора
+            POINT pt = {};
+            if (GetCursorPos(&pt)) {
+                if (pt.x < g_safeRect.left || pt.x > g_safeRect.right ||
+                    pt.y < g_safeRect.top  || pt.y > g_safeRect.bottom) {
+                    int cx = (std::max)(g_safeRect.left, (std::min)(pt.x, g_safeRect.right));
+                    int cy = (std::max)(g_safeRect.top,  (std::min)(pt.y, g_safeRect.bottom));
+                    SetCursorPos(cx, cy);
+                }
+            }
             ClipCursor(&g_lockedRect);
             return 0;
         }
@@ -1049,6 +1146,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             g_hSettingsWnd = nullptr;
         }
         if (g_isLocked) {
+            if (g_hMouseHook) {
+                UnhookWindowsHookEx(g_hMouseHook);
+                g_hMouseHook = nullptr;
+            }
+            if (g_hWinEventHook) {
+                UnhookWinEvent(g_hWinEventHook);
+                g_hWinEventHook = nullptr;
+            }
             ClipCursor(nullptr);
             g_isLocked = false;
         }
